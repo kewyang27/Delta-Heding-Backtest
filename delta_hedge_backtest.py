@@ -185,8 +185,14 @@ class MarketDataFetcher:
         if data.empty:
             raise RuntimeError("No data fetched from Yahoo Finance. Check ticker or date range.")
 
+        # yfinance may return MultiIndex columns on newer versions (e.g. Streamlit Cloud)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
         # Keep only the Close for simplicity
         df = data[["Close"]].copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         df.dropna(inplace=True)
 
         # Daily log returns
@@ -380,8 +386,17 @@ class DeltaHedgeBacktester:
             # Optionally recenter bands daily based on yesterday's close using hedging_vol
             if self.params.recenter_bands_daily and idx > 0:
                 # Recenter bands daily using yesterday's close and band width source
-                prev_close = float(self.data["Close"].to_numpy()[idx - 1])  # S(t-1)
-                prev_vol = float(self.data["greek_vol"].to_numpy()[idx - 1])
+                prev_date = self.data.index[idx - 1]
+                prev_close = float(
+                    self.data.loc[prev_date, "Close"].iloc[0]
+                    if isinstance(self.data.loc[prev_date, "Close"], pd.Series)
+                    else self.data.loc[prev_date, "Close"]
+                )
+                prev_vol = float(
+                    self.data.loc[prev_date, "greek_vol"].iloc[0]
+                    if isinstance(self.data.loc[prev_date, "greek_vol"], pd.Series)
+                    else self.data.loc[prev_date, "greek_vol"]
+                )
                 band_vol_daily = prev_vol if self.params.use_greek_vol_for_bands else float(self.params.hedging_vol)
                 self._reset_bands(prev_close, band_vol_daily)
 
