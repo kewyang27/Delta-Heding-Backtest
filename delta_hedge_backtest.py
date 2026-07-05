@@ -154,6 +154,44 @@ class BlackScholes:
         term3 = - q * S * math.exp(-q * T) * norm.cdf(-d1)
         return float(term1 + term2 + term3)
 
+    @staticmethod
+    def strike_from_delta(
+        S: float,
+        T: float,
+        r: float,
+        q: float,
+        sigma: float,
+        target_delta: float,
+        option_type: str,
+    ) -> float:
+        """Invert BSM delta to implied strike. Call delta > 0, put delta < 0."""
+        if S <= 0:
+            raise ValueError("Spot must be positive.")
+        T = BlackScholes._ensure_positive_T(T)
+        if T == 0.0:
+            raise ValueError("Tenor must be positive.")
+        sigma = BlackScholes._ensure_positive_sigma(sigma)
+        is_put = option_type.lower() == "put"
+        if is_put and target_delta >= 0:
+            raise ValueError("Put delta must be negative (BSM).")
+        if not is_put and target_delta <= 0:
+            raise ValueError("Call delta must be positive (BSM).")
+
+        disc_q = math.exp(-q * T)
+        nd1 = 1.0 + target_delta / disc_q if is_put else target_delta / disc_q
+        if nd1 <= 0.0 or nd1 >= 1.0:
+            raise ValueError(
+                f"Delta {target_delta:.2%} is not achievable at this spot, tenor, and vol."
+            )
+
+        d1 = norm.ppf(nd1)
+        sqrtT = math.sqrt(T)
+        ln_moneyness = d1 * sigma * sqrtT - (r - q + 0.5 * sigma * sigma) * T
+        strike = S * math.exp(-ln_moneyness)
+        if strike <= 0 or not math.isfinite(strike):
+            raise ValueError("Implied strike must be positive.")
+        return float(strike)
+
 
 # ---------------------------------------------
 # Step 2: Data Fetching and Preparation Utility

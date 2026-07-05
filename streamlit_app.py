@@ -16,13 +16,13 @@ from delta_hedge_backtest import (
     StrategyParams,
     MarketDataFetcher,
     DeltaHedgeBacktester,
+    BlackScholes,
 )
 
 # Monte Carlo simulator imports
 from mc_delta_hedge_sim import (
     MCParams,
     MCDeltaHedgeSimulator,
-    BlackScholes,
     sweep_sell_vols,
 )
 
