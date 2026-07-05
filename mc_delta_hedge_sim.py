@@ -76,6 +76,42 @@ class BlackScholes:
         d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
         return math.exp(-q * T) * (norm.cdf(d1) - 1.0)
 
+    @staticmethod
+    def strike_from_delta(
+        S: float,
+        T: float,
+        r: float,
+        q: float,
+        sigma: float,
+        target_delta: float,
+        option_type: str,
+    ) -> float:
+        """Invert BSM delta to implied strike. Call delta > 0, put delta < 0."""
+        if S <= 0:
+            raise ValueError("Spot must be positive.")
+        if T <= 0:
+            raise ValueError("Tenor must be positive.")
+        sigma = max(1e-10, float(sigma))
+        is_put = option_type.lower() == "put"
+        if is_put and target_delta >= 0:
+            raise ValueError("Put delta must be negative (BSM).")
+        if not is_put and target_delta <= 0:
+            raise ValueError("Call delta must be positive (BSM).")
+
+        disc_q = math.exp(-q * T)
+        nd1 = 1.0 + target_delta / disc_q if is_put else target_delta / disc_q
+        if nd1 <= 0.0 or nd1 >= 1.0:
+            raise ValueError(
+                f"Delta {target_delta:.2%} is not achievable at this spot, tenor, and vol."
+            )
+
+        d1 = norm.ppf(nd1)
+        sqrtT = math.sqrt(T)
+        ln_moneyness = d1 * sigma * sqrtT - (r - q + 0.5 * sigma * sigma) * T
+        strike = S * math.exp(-ln_moneyness)
+        if strike <= 0 or not math.isfinite(strike):
+            raise ValueError("Implied strike must be positive.")
+        return float(strike)
 
 class MCDeltaHedgeSimulator:
     def __init__(self, params: MCParams):
@@ -587,7 +623,7 @@ def plot_sweep_heatmap(sweep_df: pd.DataFrame) -> None:
     ax.set_yticks(np.arange(len(mat.index)))
     ax.set_yticklabels([f"{sv:.2f} (dv {dv_map.get(sv, float('nan')):+.2f})" for sv in mat.index])
     ax.set_xlabel("Metric")
-    ax.set_ylabel("sell_vol (with dv)")
+    ax.set_ylabel("Vol sweep (with dv)")
     ax.set_title("Sell vol sweep vs fixed path_vol — heatmap ($)")
 
     # Colorbar

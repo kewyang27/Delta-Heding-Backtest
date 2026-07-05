@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Tuple
 
 import streamlit as st
@@ -21,6 +22,7 @@ from delta_hedge_backtest import (
 from mc_delta_hedge_sim import (
     MCParams,
     MCDeltaHedgeSimulator,
+    BlackScholes,
     sweep_sell_vols,
 )
 
@@ -83,20 +85,69 @@ def _styled_table(df: pd.DataFrame, fmt: dict[str, str] | None = None) -> None:
     st.table(styler)
 
 
-def build_params_ui() -> StrategyParams:
+def resolve_backtest_strike_from_delta(
+    params: StrategyParams,
+    data: pd.DataFrame,
+    delta_pct: float,
+) -> StrategyParams:
+    """Imply strike from delta using spot on the first hedging date and tenor to expiry."""
+    first_date = data.index[0]
+    close_val = data.loc[first_date, "Close"]
+    S0 = float(close_val.iloc[0] if isinstance(close_val, pd.Series) else close_val)
+    days = (pd.to_datetime(params.expiry_date) - pd.to_datetime(first_date)).days
+    T = max(0.0, days / 365.0)
+    signed_delta = float(delta_pct) / 100.0
+    if params.option_type.lower() == "put":
+        signed_delta = -signed_delta
+    strike = BlackScholes.strike_from_delta(
+        S0,
+        T,
+        float(params.risk_free_rate),
+        float(params.dividend_yield),
+        float(params.sell_vol),
+        signed_delta,
+        params.option_type,
+    )
+    return replace(params, strike_price=strike)
+
+
+def build_params_ui() -> tuple[StrategyParams, float, bool, dict]:
     with st.sidebar:
         st.header("Inputs")
+
+        strike_mode = st.radio(
+            "Option definition",
+            options=["Strike", "Delta (%)"],
+            horizontal=True,
+            key="bt_strike_mode",
+            index=0,
+        )
+        use_strike_input = strike_mode == "Strike"
 
         col_a, col_b = st.columns(2)
         with col_a:
             ticker = st.text_input("Ticker", value="SPY")
-            strike_price = st.number_input("Strike Price", value=500.0, step=1.0, format="%0.2f")
+            strike_price = st.number_input(
+                "Strike Price",
+                value=500.0,
+                step=1.0,
+                format="%0.2f",
+                disabled=not use_strike_input,
+            )
+            delta_pct = st.number_input(
+                "Delta (%)",
+                value=25.0,
+                step=1.0,
+                format="%0.1f",
+                disabled=use_strike_input,
+                help="Desk convention: enter positive % (e.g. 25). Call → +0.25Δ, Put → −0.25Δ.",
+            )
             risk_free_rate = st.number_input("Risk-free Rate", value=0.05, step=0.005, format="%0.3f")
             option_contracts = st.number_input("Option Contracts (short = negative)", value=-1, step=1)
         with col_b:
-            sell_vol = st.number_input("Sell Vol (IV)", value=0.40, step=0.01, format="%0.2f")
+            sell_vol = st.number_input("Buy/Sell Vol (Initial Trade Setup)", value=0.40, step=0.01, format="%0.2f")
             hedging_vol = st.number_input("Hedging Vol (bands)", value=0.30, step=0.01, format="%0.2f")
-            greek_vol_lookback = st.number_input("Greek Vol Lookback (days)", value=90, step=5)
+            greek_vol_lookback = st.number_input("Realized Vol for MTM & Greeks (days)", value=90, step=5)
             option_type = st.selectbox("Option Type", options=["Call", "Put"], index=0)
             dividend_yield = st.number_input("Dividend Yield (annual)", value=0.00, step=0.005, format="%0.3f")
 
@@ -115,7 +166,7 @@ def build_params_ui() -> StrategyParams:
 
         st.markdown("---")
         st.subheader("Comparison Settings")
-        compare_hedging_vol = st.number_input("Compare Hedging Vol", value=0.40, step=0.01, format="%0.2f")
+        compare_hedging_vol = st.number_input("Compare vs Hedging Vol 2", value=0.40, step=0.01, format="%0.2f")
 
         st.markdown("---")
         run_btn = st.button("Run Backtest", type="primary")
@@ -124,9 +175,23 @@ def build_params_ui() -> StrategyParams:
     # Align expiry to hedging_end to match hedging window
     expiry_date = pd.to_datetime(hedging_end_date)
 
+    meta: dict = {
+        "strike_mode": strike_mode,
+        "delta_pct": None,
+        "strike_error": None,
+    }
+    resolved_strike = float(strike_price)
+    if use_strike_input:
+        if resolved_strike <= 0:
+            meta["strike_error"] = "Strike must be a positive number."
+    else:
+        meta["delta_pct"] = float(delta_pct)
+        if delta_pct <= 0:
+            meta["strike_error"] = "Delta (%) must be positive."
+
     params = StrategyParams(
         ticker=str(ticker),
-        strike_price=float(strike_price),
+        strike_price=float(resolved_strike),
         expiry_date=pd.to_datetime(expiry_date),
         trade_date=pd.to_datetime(trade_date),
         risk_free_rate=float(risk_free_rate),
@@ -145,7 +210,7 @@ def build_params_ui() -> StrategyParams:
         dividend_yield=float(dividend_yield),
     )
 
-    return params, float(compare_hedging_vol), bool(run_btn)
+    return params, float(compare_hedging_vol), bool(run_btn), meta
 
 
 def plot_cumulative_pnl_and_price(portfolio: pd.DataFrame, data: pd.DataFrame, ticker: str, strike: float) -> None:
@@ -331,17 +396,42 @@ def plot_realized_vol(data: pd.DataFrame, lookback: int, ticker: str) -> None:
 # Monte Carlo (Tab 2) components
 # -------------------------------
 
-def build_mc_ui() -> tuple[MCParams, list[float], bool, bool]:
+def build_mc_ui() -> tuple[MCParams, list[float], bool, bool, dict]:
     """Build Monte Carlo parameter inputs in Tab 2 (not in sidebar)."""
     st.header("Monte Carlo Delta Hedging Simulator")
     st.caption("Simulate paths and approximate delta-hedging P&L distribution.")
+
+    strike_mode = st.radio(
+        "Option definition",
+        options=["Strike", "Delta (%)"],
+        horizontal=True,
+        key="mc_strike_mode",
+        index=0,
+    )
+    use_strike_input = strike_mode == "Strike"
 
     with st.form("mc_params_form"):
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             ticker = st.text_input("Ticker", value="SPY", key="mc_ticker")
             S0 = st.number_input("S0 (spot)", value=500.0, step=1.0, format="%0.2f", key="mc_S0")
-            strike = st.number_input("Strike", value=500.0, step=1.0, format="%0.2f", key="mc_strike")
+            strike = st.number_input(
+                "Strike",
+                value=500.0,
+                step=1.0,
+                format="%0.2f",
+                key="mc_strike",
+                disabled=not use_strike_input,
+            )
+            delta_pct = st.number_input(
+                "Delta (%)",
+                value=25.0,
+                step=1.0,
+                format="%0.1f",
+                key="mc_delta_pct",
+                disabled=use_strike_input,
+                help="Desk convention: enter positive % (e.g. 25). Call → +0.25Δ, Put → −0.25Δ.",
+            )
             risk_free_rate = st.number_input("Risk-free Rate", value=0.05, step=0.005, format="%0.3f", key="mc_r")
             cash_rate = st.number_input("Cash Rate (annual)", value=0.00, step=0.005, format="%0.3f", key="mc_cash_rate")
         with col2:
@@ -351,20 +441,20 @@ def build_mc_ui() -> tuple[MCParams, list[float], bool, bool]:
             rehedge_time_step = st.number_input("Rehedge Time Step (days)", value=1, step=1, key="mc_rehedge")
             borrow_rate = st.number_input("Borrow Rate (annual)", value=0.00, step=0.005, format="%0.3f", key="mc_borrow_rate")
         with col3:
-            sell_vol = st.number_input("Sell Vol (IV)", value=0.32, step=0.01, format="%0.2f", key="mc_sellvol")
-            path_vol = st.number_input("Path Vol (realized)", value=0.32, step=0.01, format="%0.2f", key="mc_pathvol")
+            sell_vol = st.number_input("Buy/Sell Vol (Initial Trade Setup)", value=0.32, step=0.01, format="%0.2f", key="mc_sellvol")
+            path_vol = st.number_input("Path Vol (for Simulation)", value=0.32, step=0.01, format="%0.2f", key="mc_pathvol")
             hedging_vol = st.number_input("Hedging Vol (bands)", value=0.32, step=0.01, format="%0.2f", key="mc_hedgevol")
             use_greek_vol_for_bands = st.checkbox("Use dynamic Greeks vol for bands", value=False, key="mc_use_greek_bands")
             option_type_mc = st.selectbox("Option Type", options=["Call", "Put"], index=0, key="mc_option_type")
         with col4:
-            greeks_vol_lookback = st.number_input("Greeks Vol Lookback (days)", value=60, step=5, key="mc_lookback")
+            greeks_vol_lookback = st.number_input("Realized Vol for MTM & Greeks (days)", value=60, step=5, key="mc_lookback")
             T_years = st.number_input("Tenor in Years", value=0.5, step=0.05, format="%0.2f", key="mc_T")
             steps_per_year = st.number_input("Steps per Year", value=252, step=1, key="mc_steps")
             n_paths = st.number_input("# Monte Carlo Paths", value=2000, step=500, key="mc_npaths")
             seed = st.number_input("Seed (None for random)", value=42, step=1, key="mc_seed")
 
         st.markdown("---")
-        st.subheader("Sweep Settings (sell_vol)")
+        st.subheader("Vol Sweep Settings")
         col_s1, col_s2, col_s3 = st.columns(3)
         with col_s1:
             sweep_min = st.number_input("Min", value=0.20, step=0.01, format="%0.2f", key="mc_sweep_min")
@@ -377,10 +467,40 @@ def build_mc_ui() -> tuple[MCParams, list[float], bool, bool]:
 
     sweep_list = list(np.round(np.arange(sweep_min, sweep_max + 1e-9, sweep_step), 2))
 
+    meta: dict = {
+        "strike_mode": strike_mode,
+        "delta_pct": None,
+        "strike_error": None,
+    }
+    resolved_strike = float(strike)
+    if use_strike_input:
+        if resolved_strike <= 0:
+            meta["strike_error"] = "Strike must be a positive number."
+    else:
+        meta["delta_pct"] = float(delta_pct)
+        if delta_pct <= 0:
+            meta["strike_error"] = "Delta (%) must be positive."
+        else:
+            signed_delta = delta_pct / 100.0
+            if str(option_type_mc).lower() == "put":
+                signed_delta = -signed_delta
+            try:
+                resolved_strike = BlackScholes.strike_from_delta(
+                    S=float(S0),
+                    T=float(T_years),
+                    r=float(risk_free_rate),
+                    q=float(dividend_yield),
+                    sigma=float(sell_vol),
+                    target_delta=signed_delta,
+                    option_type=str(option_type_mc),
+                )
+            except ValueError as exc:
+                meta["strike_error"] = str(exc)
+
     params = MCParams(
         ticker=str(ticker),
         S0=float(S0),
-        strike_price=float(strike),
+        strike_price=float(resolved_strike),
         risk_free_rate=float(risk_free_rate),
         dividend_yield=float(dividend_yield),
         option_contracts=int(option_contracts),
@@ -402,7 +522,7 @@ def build_mc_ui() -> tuple[MCParams, list[float], bool, bool]:
 
     # Single button triggers both base run and sweep outputs
     run_sweep = run_mc
-    return params, sweep_list, bool(run_mc), bool(run_sweep)
+    return params, sweep_list, bool(run_mc), bool(run_sweep), meta
 
 
 def plot_mc_histogram(vals: np.ndarray) -> None:
@@ -581,8 +701,8 @@ def plot_mc_heatmap(sweep_df: pd.DataFrame) -> None:
     ax.set_yticks(np.arange(len(mat.index)))
     ax.set_yticklabels([f"{sv:.2f} (dv {dv_map.get(sv, float('nan')):+.2f})" for sv in mat.index])
     ax.set_xlabel("Metric")
-    ax.set_ylabel("sell_vol (with dv)")
-    ax.set_title("Sell vol sweep vs fixed path_vol — heatmap ($)")
+    ax.set_ylabel("Vol sweep (with dv)")
+    ax.set_title("Buy/Sell Vol Sweep vs Path Vol")
     cbar = fig.colorbar(im, ax=ax)
     cbar.ax.set_ylabel("$", rotation=270, labelpad=12)
     st.pyplot(fig)
@@ -637,17 +757,21 @@ def plot_comparison(data: pd.DataFrame, base_params: StrategyParams, base_portfo
     backtester_dyn = DeltaHedgeBacktester(params_dyn, data)
     portfolio_dyn = backtester_dyn.run()
 
+    label_base = "Hedging Vol"
+    label_cmp = "Hedging Vol 2"
+    label_dyn = f"{base_params.greek_vol_lookback}-d Realized Vol"
+
     fig, ax_left = plt.subplots(figsize=(12, 5))
     ax_right = ax_left.twinx()
-    ax_left.plot(base_portfolio.index, base_portfolio["cumulative_pnl"], label=f"Hedge vol {base_params.hedging_vol:.2f}", color="tab:blue")
-    ax_left.plot(portfolio_cmp.index, portfolio_cmp["cumulative_pnl"], label=f"Hedge vol {float(compare_hedging_vol):.2f}", color="tab:green")
-    ax_left.plot(portfolio_dyn.index, portfolio_dyn["cumulative_pnl"], label=f"Bands = {base_params.greek_vol_lookback}d RV", color="tab:red")
+    ax_left.plot(base_portfolio.index, base_portfolio["cumulative_pnl"], label=label_base, color="tab:blue")
+    ax_left.plot(portfolio_cmp.index, portfolio_cmp["cumulative_pnl"], label=label_cmp, color="tab:green")
+    ax_left.plot(portfolio_dyn.index, portfolio_dyn["cumulative_pnl"], label=label_dyn, color="tab:red")
     ax_right.plot(data.index, data["Close"], color="tab:orange", alpha=0.6, label=f"{base_params.ticker} Close")
     ax_left.set_xlabel("Date")
     ax_left.set_ylabel("Cumulative PnL")
     ax_right.set_ylabel("Price")
     ax_left.grid(True, linestyle="--", alpha=0.3)
-    title = f"Cumulative PnL Comparison: Hedge vol {base_params.hedging_vol:.2f} vs {float(compare_hedging_vol):.2f} vs bands={base_params.greek_vol_lookback}d RV (sell vol {base_params.sell_vol:.2f})"
+    title = f"Cumulative PnL Comparison: {label_base} vs {label_cmp} vs {label_dyn}"
     ax_left.set_title(title)
     lines_left, labels_left = ax_left.get_legend_handles_labels()
     lines_right, labels_right = ax_right.get_legend_handles_labels()
@@ -656,11 +780,11 @@ def plot_comparison(data: pd.DataFrame, base_params: StrategyParams, base_portfo
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Final Cum PnL (base)", f"{float(base_portfolio['cumulative_pnl'].iloc[-1]):,.2f}")
+        st.metric(f"Final Cum PnL ({label_base})", f"{float(base_portfolio['cumulative_pnl'].iloc[-1]):,.2f}")
     with col2:
-        st.metric("Final Cum PnL (compare)", f"{float(portfolio_cmp['cumulative_pnl'].iloc[-1]):,.2f}")
+        st.metric(f"Final Cum PnL ({label_cmp})", f"{float(portfolio_cmp['cumulative_pnl'].iloc[-1]):,.2f}")
     with col3:
-        st.metric("Final Cum PnL (bands=RV)", f"{float(portfolio_dyn['cumulative_pnl'].iloc[-1]):,.2f}")
+        st.metric(f"Final Cum PnL ({base_params.greek_vol_lookback}-days RV)", f"{float(portfolio_dyn['cumulative_pnl'].iloc[-1]):,.2f}")
 
     if show_ex_fin:
         # Overlay ex-fin cumulative PnL (with financing removed)
@@ -673,12 +797,12 @@ def plot_comparison(data: pd.DataFrame, base_params: StrategyParams, base_portfo
         dyn_ex = _cum_ex_fin(portfolio_dyn)
 
         fig_ex, ax_ex = plt.subplots(figsize=(12, 4))
-        ax_ex.plot(base_portfolio.index, base_portfolio["cumulative_pnl"], color="tab:blue", label=f"Base with fin")
-        ax_ex.plot(base_portfolio.index, base_ex, color="tab:blue", linestyle="--", label=f"Base ex-fin")
-        ax_ex.plot(portfolio_cmp.index, portfolio_cmp["cumulative_pnl"], color="tab:green", label=f"Cmp with fin")
-        ax_ex.plot(portfolio_cmp.index, cmp_ex, color="tab:green", linestyle="--", label=f"Cmp ex-fin")
-        ax_ex.plot(portfolio_dyn.index, portfolio_dyn["cumulative_pnl"], color="tab:red", label=f"RV with fin")
-        ax_ex.plot(portfolio_dyn.index, dyn_ex, color="tab:red", linestyle="--", label=f"RV ex-fin")
+        ax_ex.plot(base_portfolio.index, base_portfolio["cumulative_pnl"], color="tab:blue", label=f"{label_base} with fin")
+        ax_ex.plot(base_portfolio.index, base_ex, color="tab:blue", linestyle="--", label=f"{label_base} ex-fin")
+        ax_ex.plot(portfolio_cmp.index, portfolio_cmp["cumulative_pnl"], color="tab:green", label=f"{label_cmp} with fin")
+        ax_ex.plot(portfolio_cmp.index, cmp_ex, color="tab:green", linestyle="--", label=f"{label_cmp} ex-fin")
+        ax_ex.plot(portfolio_dyn.index, portfolio_dyn["cumulative_pnl"], color="tab:red", label=f"{label_dyn} with fin")
+        ax_ex.plot(portfolio_dyn.index, dyn_ex, color="tab:red", linestyle="--", label=f"{label_dyn} ex-fin")
         ax_ex.set_title("Cumulative PnL: with vs ex-financing (overlay)")
         ax_ex.set_xlabel("Date")
         ax_ex.set_ylabel("Cumulative PnL")
@@ -687,7 +811,7 @@ def plot_comparison(data: pd.DataFrame, base_params: StrategyParams, base_portfo
         st.pyplot(fig_ex)
 
         # Grouped bar: final totals with and without financing
-        labels = ["Base", "Compare", "Bands=RV"]
+        labels = [label_base, label_cmp, label_dyn]
         with_fin = [
             float(base_portfolio["cumulative_pnl"].iloc[-1]),
             float(portfolio_cmp["cumulative_pnl"].iloc[-1]),
@@ -722,9 +846,9 @@ def plot_comparison(data: pd.DataFrame, base_params: StrategyParams, base_portfo
         return int((df["stock_holding"].diff().fillna(0) != 0).sum())
 
     counts = {
-        f"Hedge vol {base_params.hedging_vol:.2f}": _count_rehedges(base_portfolio),
-        f"Hedge vol {float(compare_hedging_vol):.2f}": _count_rehedges(portfolio_cmp),
-        f"Bands {base_params.greek_vol_lookback}d RV": _count_rehedges(portfolio_dyn),
+        label_base: _count_rehedges(base_portfolio),
+        label_cmp: _count_rehedges(portfolio_cmp),
+        label_dyn: _count_rehedges(portfolio_dyn),
     }
     fig2, ax2 = plt.subplots(figsize=(6, 3.6))
     ax2.bar(list(counts.keys()), list(counts.values()), color=["tab:blue", "tab:green", "tab:red"]) 
@@ -1172,6 +1296,111 @@ def render_frontier_tab() -> None:
         )
 
 
+def _run_historical_backtest(
+    params: StrategyParams,
+    data: pd.DataFrame,
+    compare_hedging_vol: float,
+) -> None:
+    backtester = DeltaHedgeBacktester(params, data)
+    portfolio = backtester.run()
+
+    st.subheader("1) Cumulative PnL vs Price")
+    plot_cumulative_pnl_and_price(portfolio, data, params.ticker, params.strike_price)
+
+    st.subheader("2) PnL Attribution (Theta/Gamma/Vega/Residual)")
+    plot_attribution_layers(portfolio)
+
+    st.subheader("3) Realized Volatility")
+    plot_realized_vol(data, params.greek_vol_lookback, params.ticker)
+
+    st.subheader("4) Hedging Vol Comparison")
+    plot_comparison(data, params, portfolio, compare_hedging_vol, show_ex_fin=True)
+
+    if float(params.cash_rate) == 0.0 and float(params.borrow_rate) == 0.0:
+        st.info(
+            "Financing rates are zero; 'with' and 'ex-fin' series will overlap. "
+            "Set non-zero cash/borrow rates to see differences."
+        )
+
+    st.subheader("5) Financing vs Total")
+    plot_financing_vs_total(portfolio)
+
+    st.subheader("6) P&L Impact of Financing")
+    plot_historical_pnl_financing_impact(portfolio)
+
+    st.markdown("---")
+    with st.expander("Show last 5 rows of portfolio"):
+        _styled_table(portfolio.tail().reset_index())
+
+    st.markdown("---")
+    st.subheader("Export Results")
+    try:
+        cmp_params = StrategyParams(
+            ticker=params.ticker,
+            strike_price=params.strike_price,
+            expiry_date=params.expiry_date,
+            trade_date=params.trade_date,
+            risk_free_rate=params.risk_free_rate,
+            option_contracts=params.option_contracts,
+            sell_vol=params.sell_vol,
+            hedging_vol=float(compare_hedging_vol),
+            greek_vol_lookback=params.greek_vol_lookback,
+            hedging_start_date=params.hedging_start_date,
+            hedging_end_date=params.hedging_end_date,
+            strict_window=params.strict_window,
+            use_greek_vol_for_bands=False,
+            recenter_bands_daily=params.recenter_bands_daily,
+            cash_rate=params.cash_rate,
+            borrow_rate=params.borrow_rate,
+            option_type=params.option_type,
+            dividend_yield=params.dividend_yield,
+        )
+        backtester_cmp = DeltaHedgeBacktester(cmp_params, data)
+        portfolio_cmp = backtester_cmp.run()
+
+        dyn_params = StrategyParams(
+            ticker=params.ticker,
+            strike_price=params.strike_price,
+            expiry_date=params.expiry_date,
+            trade_date=params.trade_date,
+            risk_free_rate=params.risk_free_rate,
+            option_contracts=params.option_contracts,
+            sell_vol=params.sell_vol,
+            hedging_vol=params.hedging_vol,
+            greek_vol_lookback=params.greek_vol_lookback,
+            hedging_start_date=params.hedging_start_date,
+            hedging_end_date=params.hedging_end_date,
+            strict_window=params.strict_window,
+            use_greek_vol_for_bands=True,
+            recenter_bands_daily=params.recenter_bands_daily,
+            cash_rate=params.cash_rate,
+            borrow_rate=params.borrow_rate,
+            option_type=params.option_type,
+            dividend_yield=params.dividend_yield,
+        )
+        backtester_dyn = DeltaHedgeBacktester(dyn_params, data)
+        portfolio_dyn = backtester_dyn.run()
+
+        start_str = pd.to_datetime(params.trade_date).strftime("%Y%m%d")
+        end_str = pd.to_datetime(params.expiry_date).strftime("%Y%m%d")
+        filename = f"backtest_{params.ticker}_{start_str}_{end_str}.xlsx"
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            portfolio.to_excel(writer, sheet_name="portfolio_base")
+            portfolio_cmp.to_excel(writer, sheet_name="portfolio_cmp")
+            portfolio_dyn.to_excel(writer, sheet_name="portfolio_dyn")
+            data.to_excel(writer, sheet_name="market_data")
+        st.download_button(
+            label=f"Download Excel ({filename})",
+            data=output.getvalue(),
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        st.warning(f"Excel export unavailable: {exc}")
+
+
 def main() -> None:
     render_header()
     inject_center_table_css()
@@ -1181,10 +1410,12 @@ def main() -> None:
 
     # ------------------ Tab 1: Keep existing behavior ------------------
     with tab1:
-        params, compare_hedging_vol, run_btn = build_params_ui()
+        params, compare_hedging_vol, run_btn, bt_meta = build_params_ui()
 
         if not run_btn:
             st.info("Set inputs in the sidebar and click 'Run Backtest'.")
+        elif bt_meta.get("strike_error"):
+            st.error(f"Invalid option definition: {bt_meta['strike_error']}")
         else:
             try:
                 fetcher = MarketDataFetcher(params)
@@ -1192,129 +1423,62 @@ def main() -> None:
             except Exception as exc:
                 st.error(f"Data preparation failed: {exc}")
             else:
-                backtester = DeltaHedgeBacktester(params, data)
-                portfolio = backtester.run()
-
-                st.subheader("1) Cumulative PnL vs Price")
-                plot_cumulative_pnl_and_price(portfolio, data, params.ticker, params.strike_price)
-
-                st.subheader("2) PnL Attribution (Theta/Gamma/Vega/Residual)")
-                plot_attribution_layers(portfolio)
-
-                st.subheader("3) Realized Volatility")
-                plot_realized_vol(data, params.greek_vol_lookback, params.ticker)
-
-                st.subheader("4) Hedging Vol Comparison")
-                plot_comparison(data, params, portfolio, compare_hedging_vol, show_ex_fin=True)
-
-                # Guidance if financing is zero and ex-fin lines overlap
-                if float(params.cash_rate) == 0.0 and float(params.borrow_rate) == 0.0:
-                    st.info("Financing rates are zero; 'with' and 'ex-fin' series will overlap. Set non-zero cash/borrow rates to see differences.")
-
-                st.subheader("5) Financing vs Total")
-                plot_financing_vs_total(portfolio)
-
-                st.subheader("6) P&L Impact of Financing")
-                plot_historical_pnl_financing_impact(portfolio)
-
-                st.markdown("---")
-                with st.expander("Show last 5 rows of portfolio"):
-                    _styled_table(portfolio.tail().reset_index())
-
-                # Download buttons for Excel export (base and comparison runs)
-                st.markdown("---")
-                st.subheader("Export Results")
-                try:
-                    # Reuse comparison portfolios for export
-                    cmp_params = StrategyParams(
-                        ticker=params.ticker,
-                        strike_price=params.strike_price,
-                        expiry_date=params.expiry_date,
-                        trade_date=params.trade_date,
-                        risk_free_rate=params.risk_free_rate,
-                        option_contracts=params.option_contracts,
-                        sell_vol=params.sell_vol,
-                        hedging_vol=float(compare_hedging_vol),
-                        greek_vol_lookback=params.greek_vol_lookback,
-                        hedging_start_date=params.hedging_start_date,
-                        hedging_end_date=params.hedging_end_date,
-                        strict_window=params.strict_window,
-                        use_greek_vol_for_bands=False,
-                        recenter_bands_daily=params.recenter_bands_daily,
-                        cash_rate=params.cash_rate,
-                        borrow_rate=params.borrow_rate,
-                        option_type=params.option_type,
-                        dividend_yield=params.dividend_yield,
-                    )
-                    backtester_cmp = DeltaHedgeBacktester(cmp_params, data)
-                    portfolio_cmp = backtester_cmp.run()
-
-                    dyn_params = StrategyParams(
-                        ticker=params.ticker,
-                        strike_price=params.strike_price,
-                        expiry_date=params.expiry_date,
-                        trade_date=params.trade_date,
-                        risk_free_rate=params.risk_free_rate,
-                        option_contracts=params.option_contracts,
-                        sell_vol=params.sell_vol,
-                        hedging_vol=params.hedging_vol,
-                        greek_vol_lookback=params.greek_vol_lookback,
-                        hedging_start_date=params.hedging_start_date,
-                        hedging_end_date=params.hedging_end_date,
-                        strict_window=params.strict_window,
-                        use_greek_vol_for_bands=True,
-                        recenter_bands_daily=params.recenter_bands_daily,
-                        cash_rate=params.cash_rate,
-                        borrow_rate=params.borrow_rate,
-                        option_type=params.option_type,
-                        dividend_yield=params.dividend_yield,
-                    )
-                    backtester_dyn = DeltaHedgeBacktester(dyn_params, data)
-                    portfolio_dyn = backtester_dyn.run()
-
-                    start_str = pd.to_datetime(params.trade_date).strftime('%Y%m%d')
-                    end_str = pd.to_datetime(params.expiry_date).strftime('%Y%m%d')
-                    filename = f"backtest_{params.ticker}_{start_str}_{end_str}.xlsx"
-
-                    output = BytesIO()
-                    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                        portfolio.to_excel(writer, sheet_name="portfolio_base")
-                        portfolio_cmp.to_excel(writer, sheet_name="portfolio_cmp")
-                        portfolio_dyn.to_excel(writer, sheet_name="portfolio_dyn")
-                        data.to_excel(writer, sheet_name="market_data")
-                    st.download_button(
-                        label=f"Download Excel ({filename})",
-                        data=output.getvalue(),
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                except Exception as exc:
-                    st.warning(f"Excel export unavailable: {exc}")
+                if bt_meta.get("strike_mode") == "Delta (%)":
+                    try:
+                        params = resolve_backtest_strike_from_delta(
+                            params, data, float(bt_meta["delta_pct"])
+                        )
+                    except ValueError as exc:
+                        st.error(f"Could not imply strike from delta: {exc}")
+                    else:
+                        signed = bt_meta["delta_pct"] / 100.0
+                        if params.option_type.lower() == "put":
+                            signed = -signed
+                        st.info(
+                            f"Implied strike: **{params.strike_price:,.2f}** "
+                            f"(from {bt_meta['delta_pct']:.1f}% Δ → {signed:+.2f} BSM delta, "
+                            f"{params.option_type}, vol {params.sell_vol:.0%})"
+                        )
+                        _run_historical_backtest(params, data, compare_hedging_vol)
+                else:
+                    _run_historical_backtest(params, data, compare_hedging_vol)
 
     # ------------------ Tab 2: Monte Carlo Simulation ------------------
     with tab2:
-        mc_params, sweep_list, run_mc, run_sweep = build_mc_ui()
+        mc_params, sweep_list, run_mc, run_sweep, mc_meta = build_mc_ui()
 
         if run_mc:
-            sim = MCDeltaHedgeSimulator(mc_params)
-            df = sim.run()
-            vals = df["final_portfolio_value"].values
-            st.subheader("Monte Carlo — Base Scenario Summary")
-            base_stats = pd.Series(vals).describe(percentiles=[0.05, 0.5, 0.95]).rename("final_portfolio_value")
-            _styled_table(base_stats.to_frame())
-            st.subheader("Distribution")
-            plot_mc_histogram(vals)
-            if "final_portfolio_value_ex_fin" in df.columns:
-                st.subheader("Distribution: with vs ex-financing")
-                plot_mc_histogram_dual(df)
-                st.markdown("---")
-                st.subheader("Mean P&L: Financing Impact")
-                plot_mean_pnl_comparison(df)
-            # Persist last successful params for export on rerun
-            st.session_state["mc_last_params"] = mc_params
+            if mc_meta.get("strike_error"):
+                st.error(f"Invalid option definition: {mc_meta['strike_error']}")
+            else:
+                sim = MCDeltaHedgeSimulator(mc_params)
+                df = sim.run()
+                vals = df["final_portfolio_value"].values
+                st.subheader("Monte Carlo — Base Scenario Summary")
+                if mc_meta.get("strike_mode") == "Delta (%)":
+                    signed = mc_meta["delta_pct"] / 100.0
+                    if mc_params.option_type.lower() == "put":
+                        signed = -signed
+                    st.info(
+                        f"Implied strike: **{mc_params.strike_price:,.2f}** "
+                        f"(from {mc_meta['delta_pct']:.1f}% Δ → {signed:+.2f} BSM delta, "
+                        f"{mc_params.option_type}, vol {mc_params.sell_vol:.0%})"
+                    )
+                base_stats = pd.Series(vals).describe(percentiles=[0.05, 0.5, 0.95]).rename("final_portfolio_value")
+                _styled_table(base_stats.to_frame())
+                st.subheader("Distribution")
+                plot_mc_histogram(vals)
+                if "final_portfolio_value_ex_fin" in df.columns:
+                    st.subheader("Distribution: with vs ex-financing")
+                    plot_mc_histogram_dual(df)
+                    st.markdown("---")
+                    st.subheader("Mean P&L: Financing Impact")
+                    plot_mean_pnl_comparison(df)
+                # Persist last successful params for export on rerun
+                st.session_state["mc_last_params"] = mc_params
 
-        if run_sweep:
-            st.subheader("Sell Vol Sweep Results")
+        if run_sweep and not mc_meta.get("strike_error"):
+            st.subheader("Buy/Sell Vol Sweep Results")
             sweep_df = sweep_sell_vols(mc_params, sweep_list)
             _styled_table(
                 sweep_df,
