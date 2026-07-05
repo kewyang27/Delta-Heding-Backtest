@@ -688,10 +688,9 @@ def plot_mc_heatmap(sweep_df: pd.DataFrame) -> None:
     dv_map = dict(zip(display["sell_vol"], display["dv"]))
 
     fig, ax = plt.subplots(figsize=(8, 4.8))
-    cmap = mpl.cm.get_cmap("RdYlGn")
     vmax = float(np.nanmax(np.abs(mat.values)))
     norm = mpl.colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
-    im = ax.imshow(mat.values, aspect="auto", cmap=cmap, norm=norm)
+    im = ax.imshow(mat.values, aspect="auto", cmap="RdYlGn", norm=norm)
     for i in range(mat.shape[0]):
         for j in range(mat.shape[1]):
             val = mat.values[i, j]
